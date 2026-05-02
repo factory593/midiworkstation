@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>Ultimate 88-Key 3D FM Synthesizer (MIDI Support)</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <style>
+        :root { --neon-cyan: #00f2ff; --neon-pink: #ff00ff; --dark-bg: #0a0a0a; }
+        body { background: var(--dark-bg); color: #fff; font-family: 'Malgun Gothic', sans-serif; margin: 0; overflow: hidden; display: flex; flex-direction: column; align-items: center; }
+        
+        #ui-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 10; }
+        #ui-layer > * { pointer-events: auto; }
+
+        /* 컨트롤 패널 */
+        #controls { background: rgba(20, 20, 20, 0.85); padding: 15px; border-radius: 10px; position: absolute; top: 20px; left: 20px; width: 250px; border: 1px solid #333; box-shadow: 0 0 15px rgba(0,0,0,0.5); }
+        .control-item { margin-bottom: 12px; font-size: 13px; }
+        .control-item label { display: flex; justify-content: space-between; margin-bottom: 5px; color: var(--neon-cyan); }
+        input[type=range] { width: 100%; accent-color: var(--neon-cyan); cursor: pointer; }
+
+        /* 테스트 버튼 */
+        #test-panel { position: absolute; top: 20px; right: 20px; width: 220px; text-align: center; }
+        .btn-test { 
+            background: linear-gradient(45deg, #00c2ff, #ff00ff); 
+            border: none; color: white; padding: 15px 20px; border-radius: 30px; 
+            font-weight: bold; cursor: pointer; width: 100%; box-shadow: 0 0 20px rgba(255,0,255,0.4);
+            transition: transform 0.2s, filter 0.2s;
+        }
+        .btn-test:hover { transform: scale(1.05); filter: brightness(1.2); }
+
+        /* 3D 뷰 회전 슬라이더 */
+        #view-slider-container { position: absolute; bottom: 160px; width: 50%; text-align: center; left: 50%; transform: translateX(-50%); }
+
+        /* 88건반 */
+        #keyboard-scroll-container { position: absolute; bottom: 0; width: 100%; height: 140px; overflow-x: auto; background: #111; border-top: 2px solid #333; }
+        .keyboard { display: flex; height: 120px; padding: 0 10px; width: fit-content; }
+        .key { width: 28px; height: 120px; background: white; border: 1px solid #ccc; border-radius: 0 0 4px 4px; cursor: pointer; flex-shrink: 0; z-index: 1; transition: background 0.1s; }
+        .key.black { width: 18px; height: 75px; background: #222; margin-left: -9px; margin-right: -9px; z-index: 2; border: 1px solid #000; }
+        .key.active { background: var(--neon-cyan) !important; box-shadow: inset 0 0 10px rgba(0,0,0,0.5); }
+
+        #keyboard-scroll-container::-webkit-scrollbar { height: 8px; }
+        #keyboard-scroll-container::-webkit-scrollbar-thumb { background: #444; border-radius: 4px; }
+        #keyboard-scroll-container::-webkit-scrollbar-thumb:hover { background: var(--neon-cyan); }
+    </style>
+</head>
+<body>
+
+<div id="ui-layer">
+    <div id="controls">
+        <div class="control-item">
+            <label>FM Ratio <span id="v-ratio">2.0</span></label>
+            <input type="range" id="ratio" min="0.5" max="12" step="0.1" value="2.0">
+        </div>
+        <div class="control-item">
+            <label>Mod Depth <span id="v-depth">150</span></label>
+            <input type="range" id="depth" min="0" max="1000" step="10" value="150">
+        </div>
+        <div id="midi-status" style="font-size: 10px; color: #666; margin-top: 10px;">MIDI: Scanning...</div>
+    </div>
+
+    <div id="test-panel">
+        <button class="btn-test" onclick="playCrossEncounter()">TEST: CROSS ENCOUNTER</button>
+    </div>
+
+    <div id="view-slider-container">
+        <input type="range" id="viewRotation" min="-1.5" max="1.5" step="0.01" value="0">
+    </div>
+
+    <div id="keyboard-scroll-container">
+        <div class="keyboard" id="keyboard"></div>
+    </div>
+</div>
+
+<script>
+    let audioCtx, analyzer, dataArray;
+    const activeVoices = new Map();
+    const keyMap = new Map(); // 주파수 -> 엘리먼트 맵핑
+
+    // --- 1. Three.js 3D Waterfall Setup ---
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    const segments = 128, history = 60;
+    const geometry = new THREE.PlaneGeometry(30, 30, segments - 1, history - 1);
+    const material = new THREE.MeshBasicMaterial({ color: 0x00f2ff, wireframe: true, transparent: true, opacity: 0.6 });
+    const waterfall = new THREE.Mesh(geometry, material);
+    waterfall.rotation.x = -Math.PI / 2.5;
+    scene.add(waterfall);
+
+    camera.position.set(0, 15, 25);
+    camera.lookAt(0, 2, 0);
+
+    function initAudio() {
+        if (audioCtx) return;
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        analyzer = audioCtx.createAnalyser();
+        analyzer.fftSize = 256;
+        dataArray = new Uint8Array(analyzer.frequencyBinCount);
+        analyzer.connect(audioCtx.destination);
+    }
+
+    function animate() {
+        requestAnimationFrame(animate);
+        if (analyzer) {
+            analyzer.getByteFrequencyData(dataArray);
+            const vertices = geometry.attributes.position.array;
+            // 지형 데이터 밀어내기 (시간 축)
+            for (let i = history - 1; i > 0; i--) {
+                for (let j = 0; j < segments; j++) {
+                    vertices[(i * segments + j) * 3 + 2] = vertices[((i - 1) * segments + j) * 3 + 2];
+                }
+            }
+            // 새로운 진폭 데이터 넣기
+            for (let j = 0; j < segments; j++) {
+                vertices[(0 * segments + j) * 3 + 2] = (dataArray[j] / 255) * 8;
+            }
+            geometry.attributes.position.needsUpdate = true;
+        }
+        waterfall.rotation.z = parseFloat(document.getElementById('viewRotation').value);
+        renderer.render(scene, camera);
+    }
+
+    // --- 2. 88-Key Keyboard Generation ---
+    function setupKeyboard() {
+        const kb = document.getElementById('keyboard');
+        for (let i = 0; i < 88; i++) {
+            const isBlack = [1, 4, 6, 9, 11].includes((i + 9) % 12);
+            const freq = 440 * Math.pow(2, (i + 1 - 49) / 12);
+            const keyEl = document.createElement('div');
+            keyEl.className = `key ${isBlack ? 'black' : ''}`;
+            
+            keyEl.onmousedown = (e) => { e.preventDefault(); noteOn(freq, keyEl); };
+            keyEl.onmouseup = (e) => { e.preventDefault(); noteOff(freq, keyEl); };
+            keyEl.onmouseleave = (e) => { e.preventDefault(); noteOff(freq, keyEl); };
+
+            kb.appendChild(keyEl);
+            keyMap.set(Math.round(freq), keyEl);
+        }
+        const container = document.getElementById('keyboard-scroll-container');
+        container.scrollLeft = container.scrollWidth * 0.45;
+    }
+
+    // --- 3. FM Synthesis Logic ---
+    function noteOn(freq, el, autoOffDuration = 0) {
+        initAudio();
+        if (activeVoices.has(freq)) return;
+        if (el) el.classList.add('active');
+
+        const carrier = audioCtx.createOscillator();
+        const modulator = audioCtx.createOscillator();
+        const modGain = audioCtx.createGain();
+        const voiceGain = audioCtx.createGain();
+
+        carrier.frequency.value = freq;
+        modulator.frequency.value = freq * parseFloat(document.getElementById('ratio').value);
+        modGain.gain.value = parseFloat(document.getElementById('depth').value);
+
+        modulator.connect(modGain);
+        modGain.connect(carrier.frequency);
+        carrier.connect(voiceGain);
+        voiceGain.connect(analyzer);
+
+        const now = audioCtx.currentTime;
+        voiceGain.gain.setValueAtTime(0, now);
+        voiceGain.gain.linearRampToValueAtTime(0.2, now + 0.02);
+
+        modulator.start(); carrier.start();
+        activeVoices.set(freq, { carrier, modulator, voiceGain });
+
+        if (autoOffDuration > 0) {
+            setTimeout(() => noteOff(freq, el), autoOffDuration);
+        }
+    }
+
+    function noteOff(freq, el) {
+        if (!activeVoices.has(freq)) return;
+        if (el) el.classList.remove('active');
+        const v = activeVoices.get(freq);
+        const now = audioCtx.currentTime;
+        v.voiceGain.gain.exponentialRampToValueAtTime(0.001, now + 0.4);
+        setTimeout(() => {
+            try { v.carrier.stop(); v.modulator.stop(); } catch(e) {}
+            activeVoices.delete(freq);
+        }, 400);
+    }
+
+    // --- 4. Web MIDI API Implementation ---
+    if (navigator.requestMIDIAccess) {
+        navigator.requestMIDIAccess().then(access => {
+            document.getElementById('midi-status').innerText = "MIDI: Ready (Device Connected)";
+            for (let input of access.inputs.values()) {
+                input.onmidimessage = (msg) => {
+                    const [cmd, note, vel] = msg.data;
+                    const freq = 440 * Math.pow(2, (note - 69) / 12);
+                    const el = keyMap.get(Math.round(freq));
+                    if (cmd === 144 && vel > 0) noteOn(freq, el);
+                    else if (cmd === 128 || (cmd === 144 && vel === 0)) noteOff(freq, el);
+                };
+            }
+        });
+    }
+
+    // --- 5. Test Melody: Cross Encounter ---
+    async function playCrossEncounter() {
+        initAudio();
+        const tempo = 140;
+        const q = 60000 / tempo;
+        const melody = [
+            {f: 523.25, d: 0.5}, {f: 587.33, d: 0.5}, {f: 659.25, d: 1}, 
+            {f: 587.33, d: 0.5}, {f: 523.25, d: 0.5}, {f: 440.00, d: 2},
+            {f: 523.25, d: 0.5}, {f: 587.33, d: 0.5}, {f: 659.25, d: 1},
+            {f: 783.99, d: 1}, {f: 659.25, d: 2}
+        ];
+        for (const note of melody) {
+            const el = keyMap.get(Math.round(note.f));
+            noteOn(note.f, el, note.d * q * 0.8);
+            await new Promise(r => setTimeout(r, note.d * q));
+        }
+    }
+
+    // 초기화
+    setupKeyboard();
+    animate();
+
+    document.getElementById('ratio').oninput = e => document.getElementById('v-ratio').innerText = e.target.value;
+    document.getElementById('depth').oninput = e => document.getElementById('v-depth').innerText = e.target.value;
+    window.onresize = () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    };
+</script>
+</body>
+</html>
